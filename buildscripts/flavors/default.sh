@@ -23,6 +23,13 @@ cpu=armv7-a
 cpuflags=
 [[ "$ndk_triple" == "arm"* ]] && cpuflags="$cpuflags -mfpu=neon -mcpu=cortex-a8"
 
+# libbyteVC2dec.so (ByteDance VVC decoder) is arm64-only; gate the wrapper
+# accordingly. The wrapper itself uses dlopen, so there's no link-time dep.
+ENABLE_BYTEVC2=
+if [[ "$ndk_triple" == "aarch64"* ]]; then
+	ENABLE_BYTEVC2="--enable-libbytevc2"
+fi
+
 ../configure \
 	--target-os=android --enable-cross-compile --cross-prefix=$ndk_triple- --ar=$AR --cc=$CC --ranlib=$RANLIB \
 	--arch=${ndk_triple%%-*} --cpu=$cpu --pkg-config=pkg-config --nm=llvm-nm \
@@ -71,6 +78,7 @@ cpuflags=
 	--enable-mbedtls \
 	\
 	--enable-libdav1d \
+	${ENABLE_BYTEVC2} \
 	\
 	--enable-avutil \
 	--enable-avcodec \
@@ -96,6 +104,7 @@ cpuflags=
 	--enable-decoder=vp9* \
 	--enable-decoder=hevc* \
 	--enable-decoder=vvc \
+	${ENABLE_BYTEVC2:+--enable-decoder=libbytevc2} \
 	--enable-decoder=av1* \
 	--enable-decoder=libdav1d \
 	--enable-decoder=theora \

@@ -1,0 +1,421 @@
+From 0db46d4f0714f089dca54a567fd1acea7938143c Mon Sep 17 00:00:00 2001
+From: naiyQAQ <naiy@local>
+Date: Sun, 24 May 2026 14:48:04 +0800
+Subject: [PATCH] Add libbytevc2 wrapper for ByteDance VVC decoder
+
+---
+ configure               |   4 +
+ libavcodec/Makefile     |   1 +
+ libavcodec/allcodecs.c  |   3 +
+ libavcodec/libbytevc2.c | 344 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 352 insertions(+)
+ create mode 100644 libavcodec/libbytevc2.c
+
+diff --git a/configure b/configure
+index a0eed36..3719993 100755
+--- a/configure
++++ b/configure
+@@ -225,6 +225,7 @@ External library support:
+   --enable-libcodec2       enable codec2 en/decoding using libcodec2 [no]
+   --enable-libdav1d        enable AV1 decoding via libdav1d [no]
+   --enable-libdavs2        enable AVS2 decoding via libdavs2 [no]
++  --enable-libbytevc2      enable VVC decoding via ByteDance libbyteVC2dec [no]
+   --enable-libdc1394       enable IIDC-1394 grabbing using libdc1394
+                            and libraw1394 [no]
+   --enable-libdvdnav       enable libdvdnav, needed for DVD demuxing [no]
+@@ -1934,6 +1935,7 @@ EXTERNAL_LIBRARY_LIST="
+     libcelt
+     libcodec2
+     libdav1d
++    libbytevc2
+     libdc1394
+     libflite
+     libfontconfig
+@@ -3603,6 +3605,8 @@ libcodec2_encoder_deps="libcodec2"
+ libdav1d_decoder_deps="libdav1d"
+ libdav1d_decoder_select="atsc_a53 dovi_rpudec"
+ libdavs2_decoder_deps="libdavs2"
++libbytevc2_decoder_deps="libbytevc2"
++libbytevc2_decoder_select="vvc_mp4toannexb_bsf"
+ libdavs2_decoder_select="avs2_parser"
+ libfdk_aac_decoder_deps="libfdk_aac"
+ libfdk_aac_encoder_deps="libfdk_aac"
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+index fb22541..2d46974 100644
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -1153,6 +1153,7 @@ OBJS-$(CONFIG_LIBCODEC2_DECODER)          += libcodec2.o
+ OBJS-$(CONFIG_LIBCODEC2_ENCODER)          += libcodec2.o
+ OBJS-$(CONFIG_LIBDAV1D_DECODER)           += libdav1d.o av1_parse.o
+ OBJS-$(CONFIG_LIBDAVS2_DECODER)           += libdavs2.o
++OBJS-$(CONFIG_LIBBYTEVC2_DECODER)         += libbytevc2.o
+ OBJS-$(CONFIG_LIBFDK_AAC_DECODER)         += libfdk-aacdec.o
+ OBJS-$(CONFIG_LIBFDK_AAC_ENCODER)         += libfdk-aacenc.o
+ OBJS-$(CONFIG_LIBGSM_DECODER)             += libgsmdec.o
+diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
+index f5ec2e0..a4b0a88 100644
+--- a/libavcodec/allcodecs.c
++++ b/libavcodec/allcodecs.c
+@@ -387,6 +387,9 @@ extern const FFCodec ff_vp9_rkmpp_decoder;
+ extern const FFCodec ff_vp9_v4l2m2m_decoder;
+ extern const FFCodec ff_vqa_decoder;
+ extern const FFCodec ff_vqc_decoder;
++/* libbytevc2 wraps ByteDance VVC decoder; declared here (before ff_vvc_decoder)
++   so avcodec_find_decoder(AV_CODEC_ID_VVC) prefers it when enabled. */
++extern const FFCodec ff_libbytevc2_decoder;
+ extern const FFCodec ff_vvc_decoder;
+ extern const FFCodec ff_wbmp_decoder;
+ extern const FFCodec ff_wbmp_encoder;
+diff --git a/libavcodec/libbytevc2.c b/libavcodec/libbytevc2.c
+new file mode 100644
+index 0000000..b8df773
+--- /dev/null
++++ b/libavcodec/libbytevc2.c
+@@ -0,0 +1,344 @@
++/*
++ * BVC2 wrapper around libbyteVC2dec.so (ByteDance VVC decoder).
++ *
++ * This is a thin AVCodec shim that dlopen()'s libbyteVC2dec.so at runtime
++ * and forwards AVPacket → byteVC2dec_decode → AVFrame.
++ *
++ * Why a wrapper:
++ *   ByteDance's libbyteVC2dec.so is reportedly 2–4x faster than ffmpeg's
++ *   native ff_vvc_decoder for software VVC decoding. Most current mobile
++ *   SoCs (2025–2026) still lack hardware VVC decode, so software speed
++ *   matters for 1080p+ playback.
++ *
++ * Limitations:
++ *   - arm64 only (the SO is only shipped for arm64-v8a).
++ *   - Wraps the synchronous byteVC2dec_decode() entry point. Single threaded
++ *     by default; parallelism is controlled by ByteVC2Param.threads (which
++ *     we set from avctx->thread_count).
++ *   - Input MUST be Annex-B start-code framed VVC NAL units, ONE AU per
++ *     AVPacket. Our companion bvc2:// stream_cb already produces such a
++ *     stream. For other inputs, FFmpeg's mov.c demuxer would need to emit
++ *     Annex-B (which it does via the vvc_mp4toannexb bitstream filter).
++ *
++ * License: LGPL-3.0+ (matches ffmpeg LGPL build); the bundled .so is
++ *          ByteDance proprietary and must be carried separately.
++ *
++ * Build:   --enable-decoder=libbytevc2  (gated by --enable-libbytevc2,
++ *          arm64 only via configure)
++ */
++
++#include "config_components.h"
++
++#include <dlfcn.h>
++#include <stdint.h>
++
++#include "libavutil/avassert.h"
++#include "libavutil/common.h"
++#include "libavutil/imgutils.h"
++#include "libavutil/log.h"
++#include "libavutil/mem.h"
++#include "libavutil/opt.h"
++#include "libavutil/pixfmt.h"
++
++#include "avcodec.h"
++#include "codec_internal.h"
++#include "decode.h"
++#include "internal.h"
++
++
++/* ---------- libbyteVC2dec.so ABI (reverse-engineered) ---------- */
++
++typedef void ByteVC2Param;
++typedef void ByteVC2Ctx;
++typedef void ByteVC2Packet;
++typedef void ByteVC2Frame;
++
++typedef struct {
++    void *so;
++
++    void           (*get_version)(char buf[8]);
++    ByteVC2Param*  (*get_default_param)(void);
++    void           (*release_param)(ByteVC2Param *);
++    int            (*set_param_int)(ByteVC2Param *, const char *key, int64_t v);
++
++    ByteVC2Ctx*    (*create)(ByteVC2Param *);
++    void           (*destroy)(ByteVC2Ctx *);
++    int            (*flush)(ByteVC2Ctx *);
++
++    ByteVC2Packet* (*alloc_packet)(void);
++    void           (*release_packet)(ByteVC2Packet *);
++    int            (*set_packet_int)(ByteVC2Packet *, const char *key, int64_t v);
++    int            (*set_packet_ptr)(ByteVC2Packet *, const char *key, void *v);
++
++    ByteVC2Frame*  (*alloc_frame)(void);
++    void           (*release_frame)(ByteVC2Frame *);
++    int64_t        (*get_frame_int)(ByteVC2Frame *, const char *key, int idx);
++    void*          (*get_frame_ptr)(ByteVC2Frame *, const char *key, int idx);
++
++    int            (*decode)(ByteVC2Ctx *ctx, ByteVC2Packet *pkt, ByteVC2Frame *out);
++} BVC2Sym;
++
++typedef struct {
++    BVC2Sym         s;
++    ByteVC2Ctx     *ctx;
++    ByteVC2Packet  *pkt;       /* reused */
++    ByteVC2Frame   *frame;     /* reused */
++
++    /* Annex-B buffer (we may need to convert mp4 length-prefix → Annex-B
++       if extradata reveals a vvcC/bv2C header). For now we assume input is
++       already Annex-B (stream_cb does the rewrite). */
++    uint8_t        *bs_buf;
++    int             bs_cap;
++} BVC2Ctx;
++
++
++#define SO_CANDIDATES { \
++    "libbyteVC2dec.so",                              \
++    "/system/lib64/libbyteVC2dec.so",                \
++    "/vendor/lib64/libbyteVC2dec.so",                \
++    NULL                                             \
++}
++
++static int load_so(AVCodecContext *avctx, BVC2Sym *s) {
++    const char *cands[] = SO_CANDIDATES;
++    void *h = NULL;
++    for (int i = 0; cands[i]; i++) {
++        h = dlopen(cands[i], RTLD_NOW | RTLD_LOCAL);
++        if (h) {
++            av_log(avctx, AV_LOG_INFO, "libbytevc2: loaded %s\n", cands[i]);
++            break;
++        }
++        av_log(avctx, AV_LOG_VERBOSE, "libbytevc2: dlopen(%s) failed: %s\n",
++               cands[i], dlerror());
++    }
++    if (!h) {
++        av_log(avctx, AV_LOG_ERROR,
++               "libbytevc2: libbyteVC2dec.so not found in standard locations\n");
++        return AVERROR(ENOSYS);
++    }
++    s->so = h;
++
++#define BIND(member, sym) do { \
++    s->member = dlsym(h, sym); \
++    if (!s->member) { \
++        av_log(avctx, AV_LOG_ERROR, "libbytevc2: missing symbol %s\n", sym); \
++        dlclose(h); s->so = NULL; \
++        return AVERROR(ENOSYS); \
++    } \
++} while (0)
++
++    BIND(get_version,       "byteVC2dec_get_version");
++    BIND(get_default_param, "byteVC2dec_get_default_param");
++    BIND(release_param,     "byteVC2dec_release_param");
++    BIND(set_param_int,     "byteVC2dec_set_param_integer_info");
++    BIND(create,            "byteVC2dec_create");
++    BIND(destroy,           "byteVC2dec_destroy");
++    BIND(flush,             "byteVC2dec_flush");
++    BIND(alloc_packet,      "byteVC2dec_alloc_packet");
++    BIND(release_packet,    "byteVC2dec_release_packet");
++    BIND(set_packet_int,    "byteVC2dec_set_packet_integer_info");
++    BIND(set_packet_ptr,    "byteVC2dec_set_packet_pointer_info");
++    BIND(alloc_frame,       "byteVC2dec_alloc_frame");
++    BIND(release_frame,     "byteVC2dec_release_frame");
++    BIND(get_frame_int,     "byteVC2dec_get_frame_integer_info");
++    BIND(get_frame_ptr,     "byteVC2dec_get_frame_pointer_info");
++    BIND(decode,            "byteVC2dec_decode");
++
++#undef BIND
++    return 0;
++}
++
++
++/* ---------- AVCodec callbacks ---------- */
++
++static av_cold int libbvc2_init(AVCodecContext *avctx) {
++    BVC2Ctx *c = avctx->priv_data;
++    int ret = load_so(avctx, &c->s);
++    if (ret < 0) return ret;
++
++    char ver[16] = {0};
++    c->s.get_version(ver);
++    av_log(avctx, AV_LOG_INFO, "libbytevc2: BVC2dec version %s\n", ver);
++
++    ByteVC2Param *p = c->s.get_default_param();
++    if (!p) {
++        av_log(avctx, AV_LOG_ERROR, "libbytevc2: get_default_param failed\n");
++        return AVERROR_EXTERNAL;
++    }
++
++    /* Max picture geometry: if caller doesn't know, give a generous default.
++       For BVC2dec, max_pic_width/-height = -1 means "auto from SPS". */
++    int mw = avctx->coded_width  > 0 ? avctx->coded_width  : 1920;
++    int mh = avctx->coded_height > 0 ? avctx->coded_height : 1920;
++    c->s.set_param_int(p, "max_pic_width",       mw);
++    c->s.set_param_int(p, "max_pic_height",      mh);
++
++    int threads = avctx->thread_count > 0 ? avctx->thread_count : 1;
++    if (threads > 8) threads = 8;
++    c->s.set_param_int(p, "threads",             threads);
++    c->s.set_param_int(p, "max_threads",         threads);
++    c->s.set_param_int(p, "parallel_frames",     threads);
++    c->s.set_param_int(p, "max_parallel_frames", threads);
++    c->s.set_param_int(p, "wpp_mode",            1);
++    c->s.set_param_int(p, "advanced_simd",       1);
++
++    c->ctx = c->s.create(p);
++    c->s.release_param(p);
++    if (!c->ctx) {
++        av_log(avctx, AV_LOG_ERROR, "libbytevc2: byteVC2dec_create failed\n");
++        return AVERROR_EXTERNAL;
++    }
++
++    c->pkt   = c->s.alloc_packet();
++    c->frame = c->s.alloc_frame();
++    if (!c->pkt || !c->frame) {
++        av_log(avctx, AV_LOG_ERROR, "libbytevc2: alloc_packet/frame failed\n");
++        return AVERROR(ENOMEM);
++    }
++
++    /* We will produce YUV420P 8-bit; for HDR/10-bit, ffmpeg will infer from
++       frame.bit_depth at the first decoded frame. */
++    avctx->pix_fmt = AV_PIX_FMT_YUV420P;
++    return 0;
++}
++
++static av_cold int libbvc2_close(AVCodecContext *avctx) {
++    BVC2Ctx *c = avctx->priv_data;
++    if (c->pkt   && c->s.release_packet) c->s.release_packet(c->pkt);
++    if (c->frame && c->s.release_frame)  c->s.release_frame(c->frame);
++    if (c->ctx   && c->s.destroy)        c->s.destroy(c->ctx);
++    if (c->s.so) dlclose(c->s.so);
++    av_freep(&c->bs_buf);
++    return 0;
++}
++
++static void libbvc2_flush(AVCodecContext *avctx) {
++    BVC2Ctx *c = avctx->priv_data;
++    if (c->ctx && c->s.flush) c->s.flush(c->ctx);
++}
++
++/* Convert one AVPacket (length-prefix NAL units, 4-byte BE length) to
++   Annex-B (00 00 00 01 start codes). Returns ptr to buffer (owned by c->bs_buf)
++   and writes byte length to *out_len. Returns NULL on error. */
++static uint8_t *to_annexb(BVC2Ctx *c, const AVPacket *pkt, int *out_len) {
++    /* Fast path: if packet already looks like Annex-B (starts with 00 00 0X 01),
++       just point to original data. */
++    if (pkt->size >= 4 &&
++        pkt->data[0] == 0 && pkt->data[1] == 0 &&
++        (pkt->data[2] == 1 || (pkt->data[2] == 0 && pkt->data[3] == 1))) {
++        *out_len = pkt->size;
++        return pkt->data;
++    }
++
++    /* Otherwise assume length-prefix (4B BE length + NAL). */
++    int cap_needed = pkt->size + 256; /* up to 4-byte savings per NAL */
++    if (cap_needed > c->bs_cap) {
++        uint8_t *nb = av_realloc(c->bs_buf, cap_needed);
++        if (!nb) return NULL;
++        c->bs_buf = nb; c->bs_cap = cap_needed;
++    }
++
++    const uint8_t *src = pkt->data;
++    int src_left = pkt->size;
++    int dst = 0;
++    while (src_left >= 4) {
++        uint32_t L = ((uint32_t)src[0]<<24) | ((uint32_t)src[1]<<16) |
++                     ((uint32_t)src[2]<<8)  |  src[3];
++        src += 4; src_left -= 4;
++        if ((int)L > src_left) return NULL;
++        c->bs_buf[dst++] = 0;
++        c->bs_buf[dst++] = 0;
++        c->bs_buf[dst++] = 0;
++        c->bs_buf[dst++] = 1;
++        memcpy(c->bs_buf + dst, src, L);
++        dst += L; src += L; src_left -= L;
++    }
++    *out_len = dst;
++    return c->bs_buf;
++}
++
++static int libbvc2_decode(AVCodecContext *avctx, AVFrame *frame,
++                          int *got_frame, AVPacket *avpkt) {
++    BVC2Ctx *c = avctx->priv_data;
++    *got_frame = 0;
++
++    if (!avpkt || avpkt->size == 0) {
++        /* EOF; BVC2dec has no drain interface — return 0 to signal no frame. */
++        return 0;
++    }
++
++    int bs_len = 0;
++    uint8_t *bs = to_annexb(c, avpkt, &bs_len);
++    if (!bs) return AVERROR(EINVAL);
++
++    c->s.set_packet_ptr(c->pkt, "bs",     bs);
++    c->s.set_packet_int(c->pkt, "bs_len", bs_len);
++    c->s.set_packet_int(c->pkt, "pts",    avpkt->pts);
++    c->s.set_packet_int(c->pkt, "flag",   0);
++
++    int r = c->s.decode(c->ctx, c->pkt, c->frame);
++    if (r != 0) {
++        /* BVC2dec returns nonzero when more data is needed (no frame yet)
++           or on real errors. We can't distinguish without more reverse-
++           engineering, so treat as "no frame this packet". */
++        av_log(avctx, AV_LOG_VERBOSE, "libbytevc2: decode→%d (no frame)\n", r);
++        return avpkt->size;
++    }
++
++    int w  = c->s.get_frame_int(c->frame, "width", 0);
++    int h  = c->s.get_frame_int(c->frame, "height", 0);
++    int bd = c->s.get_frame_int(c->frame, "bit_depth", 0);
++    int kf = c->s.get_frame_int(c->frame, "key_frame", 0);
++    int slc= c->s.get_frame_int(c->frame, "slice_type", 0);
++    int64_t fpts = c->s.get_frame_int(c->frame, "pts", 0);
++
++    if (w <= 0 || h <= 0) return avpkt->size;
++
++    avctx->width        = w;
++    avctx->height       = h;
++    avctx->coded_width  = w;
++    avctx->coded_height = h;
++    avctx->pix_fmt      = (bd > 8) ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
++
++    int ret = ff_get_buffer(avctx, frame, 0);
++    if (ret < 0) return ret;
++
++    /* Copy planar YUV from BVC2dec internal buffers to AVFrame.
++       BVC2dec uses its own DPB; we MUST copy out since BVC2dec recycles
++       the buffer on the next decode() call. */
++    for (int p = 0; p < 3; p++) {
++        uint8_t *src = c->s.get_frame_ptr(c->frame, "data", p);
++        int src_stride = c->s.get_frame_int(c->frame, "linesize", p);
++        if (!src) continue;
++        int plane_h  = (p == 0) ? h : (h + 1) / 2;
++        int plane_w  = (p == 0) ? w : (w + 1) / 2;
++        int copy_w   = plane_w * ((bd > 8) ? 2 : 1);
++        av_image_copy_plane(frame->data[p], frame->linesize[p],
++                            src, src_stride,
++                            copy_w, plane_h);
++    }
++
++    frame->pts        = fpts;
++    frame->pict_type  = kf ? AV_PICTURE_TYPE_I :
++                        (slc == 0 ? AV_PICTURE_TYPE_P : AV_PICTURE_TYPE_B);
++    frame->flags      = kf ? AV_FRAME_FLAG_KEY : 0;
++
++    *got_frame = 1;
++    return avpkt->size;
++}
++
++
++const FFCodec ff_libbytevc2_decoder = {
++    .p.name         = "libbytevc2",
++    CODEC_LONG_NAME("ByteDance ByteVC2 (H.266/VVC) decoder"),
++    .p.type         = AVMEDIA_TYPE_VIDEO,
++    .p.id           = AV_CODEC_ID_VVC,
++    .priv_data_size = sizeof(BVC2Ctx),
++    .init           = libbvc2_init,
++    .close          = libbvc2_close,
++    .flush          = libbvc2_flush,
++    FF_CODEC_DECODE_CB(libbvc2_decode),
++    .p.capabilities = AV_CODEC_CAP_DR1,
++    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
++    .p.wrapper_name = "libbytevc2",
++};
+-- 
+2.52.0
+
