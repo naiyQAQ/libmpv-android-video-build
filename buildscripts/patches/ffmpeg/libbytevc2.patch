@@ -1,4 +1,4 @@
-From 0db46d4f0714f089dca54a567fd1acea7938143c Mon Sep 17 00:00:00 2001
+From ddc16aa930d67faecf9877e7eb96236f7a2b89eb Mon Sep 17 00:00:00 2001
 From: naiyQAQ <naiy@local>
 Date: Sun, 24 May 2026 14:48:04 +0800
 Subject: [PATCH] Add libbytevc2 wrapper for ByteDance VVC decoder
@@ -7,8 +7,8 @@ Subject: [PATCH] Add libbytevc2 wrapper for ByteDance VVC decoder
  configure               |   4 +
  libavcodec/Makefile     |   1 +
  libavcodec/allcodecs.c  |   3 +
- libavcodec/libbytevc2.c | 344 ++++++++++++++++++++++++++++++++++++++++
- 4 files changed, 352 insertions(+)
+ libavcodec/libbytevc2.c | 397 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 405 insertions(+)
  create mode 100644 libavcodec/libbytevc2.c
 
 diff --git a/configure b/configure
@@ -68,10 +68,10 @@ index f5ec2e0..a4b0a88 100644
  extern const FFCodec ff_wbmp_encoder;
 diff --git a/libavcodec/libbytevc2.c b/libavcodec/libbytevc2.c
 new file mode 100644
-index 0000000..b8df773
+index 0000000..fdc3bd1
 --- /dev/null
 +++ b/libavcodec/libbytevc2.c
-@@ -0,0 +1,344 @@
+@@ -0,0 +1,397 @@
 +/*
 + * BVC2 wrapper around libbyteVC2dec.so (ByteDance VVC decoder).
 + *
@@ -166,8 +166,21 @@ index 0000000..b8df773
 +} BVC2Ctx;
 +
 +
++/* dlopen search order:
++ *   1) bare name  → Android linker resolves via the APK's lib/<abi>/ dir,
++ *      /system/lib64, /vendor/lib64, etc. In a normal Android APP this
++ *      already covers everything we want.
++ *   2) lib<short>.so variants — some build tools strip the "byteVC2" → "bytevc2"
++ *      case or drop the "lib" prefix; try both common forms.
++ *   3) absolute system paths — fallback for the rare case where the SO is
++ *      preinstalled on the device (vendor / OEM ROMs).
++ *
++ * If none of these work, init() returns ENOSYS and FFmpeg falls back to the
++ * next decoder registered for AV_CODEC_ID_VVC (the built-in ff_vvc_decoder).
++ */
 +#define SO_CANDIDATES { \
 +    "libbyteVC2dec.so",                              \
++    "libbytevc2dec.so",                              \
 +    "/system/lib64/libbyteVC2dec.so",                \
 +    "/vendor/lib64/libbyteVC2dec.so",                \
 +    NULL                                             \
@@ -185,9 +198,49 @@ index 0000000..b8df773
 +        av_log(avctx, AV_LOG_VERBOSE, "libbytevc2: dlopen(%s) failed: %s\n",
 +               cands[i], dlerror());
 +    }
++
++    /* Last resort: scan /proc/self/maps for any already-loaded SO whose
++       directory looks like an APK's lib/<abi>/, then dlopen by absolute path.
++       This handles edge cases where Android linker namespace isolation
++       (api 24+ greylist) blocks bare-name lookup from inside libmpv.so. */
 +    if (!h) {
-+        av_log(avctx, AV_LOG_ERROR,
-+               "libbytevc2: libbyteVC2dec.so not found in standard locations\n");
++        FILE *m = fopen("/proc/self/maps", "r");
++        if (m) {
++            char line[1024];
++            char tried[16][512] = {{0}};
++            int n_tried = 0;
++            while (fgets(line, sizeof line, m) && !h) {
++                /* line format: addr addr perms off dev:inode  /path/to/lib.so */
++                char *slash = strchr(line, '/');
++                if (!slash) continue;
++                char *nl = strchr(slash, '\n'); if (nl) *nl = 0;
++                char *base = strrchr(slash, '/');
++                if (!base) continue;
++                /* Take the directory portion */
++                *base = 0;
++                /* Skip dup */
++                int dup = 0;
++                for (int i = 0; i < n_tried; i++)
++                    if (!strcmp(tried[i], slash)) { dup = 1; break; }
++                if (dup) continue;
++                if (n_tried < 16) strncpy(tried[n_tried++], slash, 511);
++                char path[1024];
++                snprintf(path, sizeof path, "%s/libbyteVC2dec.so", slash);
++                h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
++                if (h) {
++                    av_log(avctx, AV_LOG_INFO,
++                           "libbytevc2: loaded via /proc/self/maps fallback: %s\n", path);
++                    break;
++                }
++            }
++            fclose(m);
++        }
++    }
++
++    if (!h) {
++        av_log(avctx, AV_LOG_INFO,
++               "libbytevc2: libbyteVC2dec.so not available; "
++               "falling back to FFmpeg built-in vvc decoder\n");
 +        return AVERROR(ENOSYS);
 +    }
 +    s->so = h;
